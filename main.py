@@ -4,124 +4,168 @@ from urllib.parse import urljoin, unquote
 import time
 import re
 import json
-from fastapi import FastAPI, Query
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import urllib3
 
+from fastapi import FastAPI, Query
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-app = FastAPI(title="XHAccess HLS Extractor API")
+app = FastAPI(title="XHAccess API")
 
-# ---------------- HEADERS ----------------
+# ------------------------------------------------
+
 def get_xhaccess_headers():
     return {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "*/*",
-        "Referer": "https://www.google.com/"
+        "Host": "xhaccess.com",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:146.0) Gecko/20100101 Firefox/146.0",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
 
-# ---------------- TPL FIX ----------------
+# ------------------------------------------------
+
 def process_tpl_link(hls_link):
-    if "_TPL_" not in hls_link:
+    try:
+        if "_TPL_" not in hls_link:
+            return hls_link
+
+        decoded_link = unquote(hls_link)
+        multi_match = re.search(r'multi=([^/]+)', decoded_link)
+
+        if multi_match:
+            res_labels = re.findall(r'(\d+p)', multi_match.group(1))
+            if res_labels:
+                best_res = sorted(
+                    set(res_labels),
+                    key=lambda x: int(x.replace('p', ''))
+                )[-1]
+                return hls_link.replace('_TPL_', best_res)
+
+        return hls_link.replace('_TPL_', '720p')
+
+    except:
         return hls_link
 
-    decoded = unquote(hls_link)
-    match = re.search(r'multi=([^/]+)', decoded)
+# ------------------------------------------------
 
-    if match:
-        res = re.findall(r'(\d+p)', match.group(1))
-        if res:
-            best = sorted(set(res), key=lambda x: int(x[:-1]))[-1]
-            return hls_link.replace("_TPL_", best)
+def extract_hls_from_video(video_url, session, results):
+    try:
+        response = session.get(video_url, timeout=30, verify=False)
+        if response.status_code != 200:
+            return
 
-    return hls_link.replace("_TPL_", "720p")
+        soup = BeautifulSoup(response.text, 'html.parser')
 
-# ---------------- VIDEO PAGE ----------------
-def extract_hls(video_url, session):
-    res = session.get(video_url, timeout=30, verify=False)
-    soup = BeautifulSoup(res.text, "html.parser")
+        title = "Unknown Title"
+        if soup.select_one('h1'):
+            title = soup.select_one('h1').get_text(strip=True)
+        elif soup.title:
+            title = soup.title.string.replace(" - xHamster.com", "").replace(" - xhaccess.com", "").strip()
 
-    title = soup.title.string if soup.title else "Unknown"
+        hls_link = None
 
-    hls = None
+        preload = soup.find('link', rel='preload', attrs={'as': 'fetch'})
+        if preload and preload.get('href') and '.m3u8' in preload.get('href'):
+            hls_link = preload.get('href')
 
-    preload = soup.find("link", rel="preload", attrs={"as": "fetch"})
-    if preload and ".m3u8" in preload.get("href", ""):
-        hls = preload["href"]
+        if not hls_link:
+            script = soup.find('script', id='initials-script')
+            if script and script.string:
+                try:
+                    data = json.loads(
+                        script.string
+                        .replace('window.initials=', '')
+                        .rstrip(';')
+                    )
+                    hls = data.get('xplayerSettings', {}).get('hls', {})
+                    if 'h264' in hls:
+                        hls_link = hls['h264'].get('url')
+                    elif 'av1' in hls:
+                        hls_link = hls['av1'].get('url')
+                except:
+                    pass
 
-    if not hls:
-        script = soup.find("script", id="initials-script")
-        if script and script.string:
-            try:
-                data = json.loads(
-                    script.string
-                    .replace("window.initials=", "")
-                    .rstrip(";")
-                )
-                hls = data["xplayerSettings"]["hls"]["h264"]["url"]
-            except:
-                pass
+        if not hls_link:
+            regex = r'(https.*?\.m3u8[^"\s]*)'
+            for s in soup.find_all('script'):
+                if s.string:
+                    m = re.search(regex, s.string)
+                    if m:
+                        hls_link = m.group(1).replace('\\/', '/')
+                        break
 
-    if not hls:
-        regex = r'(https.*?\.m3u8[^"\s]*)'
-        for s in soup.find_all("script"):
-            if s.string:
-                m = re.search(regex, s.string)
-                if m:
-                    hls = m.group(1).replace("\\/", "/")
-                    break
+        if hls_link:
+            results.append({
+                "title": title,
+                "hls": process_tpl_link(hls_link)
+            })
 
-    if hls:
-        return {
-            "title": title,
-            "hls": process_tpl_link(hls)
-        }
+    except:
+        pass
 
-    return None
+# ------------------------------------------------
 
-# ---------------- API ENDPOINT ----------------
-@app.get("/url")
-def scrape(url: str = Query(..., description="xhaccess page or video url"),
-           pages: int = 1):
+def scrape_xhaccess(start_url, max_pages=1):
+    base_domain = "https://xhaccess.com"
 
     session = requests.Session()
     session.headers.update(get_xhaccess_headers())
+
     adapter = HTTPAdapter(max_retries=Retry(connect=3, backoff_factor=1))
-    session.mount("https://", adapter)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
 
     results = []
 
-    # direct video
-    if "/videos/" in url:
-        data = extract_hls(url, session)
-        return {"count": 1 if data else 0, "data": [data] if data else []}
+    if "/videos/" in start_url:
+        extract_hls_from_video(start_url, session, results)
+        return results
 
-    base = "https://xhaccess.com"
-    current = url
+    current_url = start_url
+    visited = set()
+    pages = 0
 
-    for _ in range(pages):
-        r = session.get(current, timeout=30, verify=False)
-        soup = BeautifulSoup(r.text, "html.parser")
+    while current_url and pages < max_pages:
+        if current_url in visited:
+            break
 
-        links = soup.select("a.video-thumb__image-container")
-        video_urls = list({
-            urljoin(base, a.get("href"))
-            for a in links if "/videos/" in a.get("href", "")
+        visited.add(current_url)
+        pages += 1
+
+        response = session.get(current_url, timeout=30, verify=False)
+        soup = BeautifulSoup(response.text, 'html.parser')
+
+        video_links = soup.select('a.video-thumb__image-container')
+        urls = list({
+            urljoin(base_domain, a.get('href'))
+            for a in video_links if "/videos/" in a.get('href', '')
         })
 
-        for v in video_urls:
-            data = extract_hls(v, session)
-            if data:
-                results.append(data)
-            time.sleep(0.5)
+        for v in urls:
+            extract_hls_from_video(v, session, results)
 
         next_btn = soup.select_one('a[rel="next"]')
-        if not next_btn:
+        if next_btn:
+            current_url = urljoin(base_domain, next_btn.get('href'))
+        else:
             break
-        current = urljoin(base, next_btn.get("href"))
 
+    return results
+
+# ------------------------------------------------
+# 🔥 API ENDPOINT (BAS YE ADD HUA HAI)
+# ------------------------------------------------
+
+@app.get("/url")
+def api(url: str = Query(...), pages: int = 1):
+    data = scrape_xhaccess(url, pages)
     return {
-        "count": len(results),
-        "data": results
+        "count": len(data),
+        "data": data
     }
